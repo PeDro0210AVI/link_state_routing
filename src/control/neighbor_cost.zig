@@ -34,7 +34,7 @@ pub fn send_hello_to_neighbor(raw_node_ip: []const u8, io: std.Io, stream: *Stre
 }
 
 pub fn find_neighbors_costs(raw_node_ip: []const u8, io: std.Io, streams: ArrayList(*Stream), allocator: std.mem.Allocator) !ArrayList(control.NodeRouter()) {
-    var neigbors_costs: ArrayList(control.NodeRouter()) = .{};
+    var neigbors_costs: std.StringHashMap(i64) = .{};
     defer neigbors_costs.deinit(allocator);
 
     for (0..streams.items.len) |stream_idx| {

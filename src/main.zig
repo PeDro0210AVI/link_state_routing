@@ -1,4 +1,4 @@
-const link_state_routing = @import("link_state_routing");
+const lib = @import("link_state_routing");
 pub const cli = @import("cli");
 
 pub const std = @import("std");
@@ -6,16 +6,7 @@ pub const builtin = @import("builtin");
 
 pub const ArrayList = std.ArrayList;
 
-const PlaneType = enum { Control, Data };
-
-var cli_config = struct { routing_table_path: []const u8 = "data/routing_table.csv", nodes_neighbors_path: []const u8 = "data/neighbors.txt", node_ip: []const u8 = "127.0.0.1", plane_type: []const u8 = "Control" }{};
-
-pub fn NodeInfo() type {
-    return struct {
-        host: []const u8,
-        port: usize,
-    };
-}
+var cli_config = struct { routing_table_path: []const u8 = "data/routing_table.csv", nodes_neighbors_path: []const u8 = "data/neighbors_ips.txt", host: []const u8 = "127.0.0.1", port: usize = 8080, plane_type: []const u8 = "Control" }{};
 
 pub fn main(init: std.process.Init) !void {
     var r = cli.AppRunner.init(&init);
@@ -33,9 +24,13 @@ pub fn main(init: std.process.Init) !void {
                 .help = "path with NodeInfo for each neighbor",
                 .value_ref = r.mkRef(&cli_config.nodes_neighbors_path),
             }, .{
-                .long_name = "node_ip",
-                .help = "Ip of the node in the network",
-                .value_ref = r.mkRef(&cli_config.node_ip),
+                .long_name = "host",
+                .help = "Node Host",
+                .value_ref = r.mkRef(&cli_config.host),
+            }, .{
+                .long_name = "port",
+                .help = "Node port",
+                .value_ref = r.mkRef(&cli_config.port),
             }, .{
                 .long_name = "plane_type",
                 .help = "type of plane the node is working one",
@@ -50,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
     return r.run(&app);
 }
 
-fn run() !void {
+pub fn run() !void {
     var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
     defer switch (builtin.mode) {
         .Debug => std.debug.assert(debug_allocator.deinit() == .ok),
@@ -66,4 +61,12 @@ fn run() !void {
 
     // the control plane is the sample, depending in the flag and the existance of the routing_table the data plane will execute
 
+    const upper_raw_plane_type = lib.util.allocUpperString(allocator, cli_config.plane_type);
+    switch (lib.util.from_u8_array_in_to_plane_type_enums(upper_raw_plane_type)) {
+        lib.PlaneType.Control => {},
+
+        lib.PlaneType.Data => {
+            while (true) {}
+        },
+    }
 }
