@@ -37,7 +37,7 @@ pub fn find_neighbors_costs(raw_node_ip: []const u8, io: std.Io, streams: ArrayL
     var neigbors_costs: std.StringHashMap(i64) = .{};
     defer neigbors_costs.deinit(allocator);
 
-    for (0..streams.items.len) |stream_idx| {
+    for (0..streams.items.len - 1) |stream_idx| {
         try neigbors_costs.append(allocator, send_hello_to_neighbor(raw_node_ip, io, streams[stream_idx], allocator));
     }
 
