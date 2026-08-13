@@ -74,6 +74,7 @@ pub fn run() !void {
         std.debug.print("Error reading neighbors: {}\n", .{err});
         return;
     };
+
     defer structure_hosts_list.deinit(arena);
     const structure_hosts = structure_hosts_list.items;
 
@@ -93,6 +94,12 @@ pub fn run() !void {
         std.debug.print("Error processing plane type: {}\n", .{err});
         return;
     };
+
+    const loopback = try std.Io.net.IpAddress.parseIp4(cli_config.host, cli_config.port);
+    var server = try loopback.listen(io, .{ .reuse_address = true });
+    server.deinit(io);
+
+    //TODO: setup server
 
     const plane_type = try lib.util.from_u8_array_in_to_plane_type_enums(upper_raw_plane_type);
     switch (plane_type) {
