@@ -279,6 +279,12 @@ fn runControlPlane(node: *Node) !void {
         control.flooding.flood(node.io, node.neighbors, control.lsa.build(node.id, seq, links), null);
         std.debug.print("LSA propio seq={d} inundado a {d} vecinos\n", .{ seq, node.neighbors.len });
 
+        // Tabla parcial tras cada ronda: el archivo refleja lo que se sabe
+        // hasta ahora en vez de aparecer recien al final.
+        writeTable(node, false) catch |err| {
+            std.debug.print("no se pudo escribir la tabla parcial: {}\n", .{err});
+        };
+
         util.sleepMs(node.io, cli_config.round_delay_ms);
     }
 
@@ -294,8 +300,12 @@ fn runControlPlane(node: *Node) !void {
         if (v == last_version) {
             stable += tick;
         } else {
+            // Llego un LSA nuevo: reescribir con la informacion fresca.
             last_version = v;
             stable = 0;
+            writeTable(node, false) catch |err| {
+                std.debug.print("no se pudo actualizar la tabla: {}\n", .{err});
+            };
         }
     }
     std.debug.print(
@@ -303,17 +313,28 @@ fn runControlPlane(node: *Node) !void {
         .{ node.db.originCount(), waited },
     );
 
+    try writeTable(node, true);
+}
+
+/// Recalcula Dijkstra sobre la LSDB actual y reescribe el CSV. Se llama varias
+/// veces durante la corrida, por eso escribe siempre el archivo completo: nunca
+/// queda a medias. Solo la llama el hilo principal, asi que no hay carrera.
+fn writeTable(node: *Node, final: bool) !void {
     var arena_state = std.heap.ArenaAllocator.init(node.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const graph = try node.db.snapshot(arena);
     const routes = try control.spf.shortestPaths(arena, graph, node.id);
-
     try control.router_table.write(node.io, cli_config.routing_table_path, routes, node.neighbors);
-    std.debug.print("Tabla escrita en {s}:\n{s}\n", .{ cli_config.routing_table_path, control.router_table.HEADER });
-    for (routes) |r| {
-        std.debug.print("  {s},{s},{d}\n", .{ r.dest, r.next_hop, r.cost });
+
+    if (final) {
+        std.debug.print("Tabla escrita en {s}:\n{s}\n", .{ cli_config.routing_table_path, control.router_table.HEADER });
+        for (routes) |r| {
+            std.debug.print("  {s},{s},{d}\n", .{ r.dest, r.next_hop, r.cost });
+        }
+    } else {
+        std.debug.print("  -> tabla parcial: {d} rutas conocidas\n", .{routes.len});
     }
 }
 
