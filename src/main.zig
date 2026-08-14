@@ -28,6 +28,8 @@ var cli_config = struct {
     round_delay_ms: u64 = 1500,
     converge_timeout_ms: u64 = 20000,
     stable_ms: u64 = 2000,
+    /// 0 = costo por RTT medido. >0 = costo fijo por enlace.
+    link_cost: i64 = 0,
 }{};
 
 const Node = struct {
@@ -86,6 +88,40 @@ pub fn main(init: std.process.Init) !void {
                     .long_name = "converge_timeout_ms",
                     .help = "Control plane: give up waiting for convergence",
                     .value_ref = r.mkRef(&cli_config.converge_timeout_ms),
+                },
+                // Espera de los HELLO. Subir los intentos cuando los vecinos
+                // arrancan en momentos distintos, como al coordinar con las
+                // otras parejas: attempts * retry_ms es la espera maxima por
+                // vecino en cada ronda.
+                .{
+                    .long_name = "hello_attempts",
+                    .help = "HELLO retries per neighbor per round (default 10)",
+                    .value_ref = r.mkRef(&cli_config.hello_attempts),
+                },
+                .{
+                    .long_name = "hello_retry_ms",
+                    .help = "Delay between HELLO retries (default 500)",
+                    .value_ref = r.mkRef(&cli_config.hello_retry_ms),
+                },
+                .{
+                    .long_name = "lsa_rounds",
+                    .help = "How many times to re-probe and re-flood (default 3)",
+                    .value_ref = r.mkRef(&cli_config.lsa_rounds),
+                },
+                .{
+                    .long_name = "round_delay_ms",
+                    .help = "Delay between LSA rounds (default 1500)",
+                    .value_ref = r.mkRef(&cli_config.round_delay_ms),
+                },
+                .{
+                    .long_name = "stable_ms",
+                    .help = "LSDB must be unchanged this long to converge (default 2000)",
+                    .value_ref = r.mkRef(&cli_config.stable_ms),
+                },
+                .{
+                    .long_name = "link_cost",
+                    .help = "Fixed cost per link; 0 = use measured RTT (default 0)",
+                    .value_ref = r.mkRef(&cli_config.link_cost),
                 },
             }),
             .target = cli.CommandTarget{
@@ -231,6 +267,7 @@ fn runControlPlane(node: *Node) !void {
             node.neighbors,
             cli_config.hello_attempts,
             cli_config.hello_retry_ms,
+            cli_config.link_cost,
         );
         defer {
             for (links.map.keys()) |k| node.allocator.free(k);

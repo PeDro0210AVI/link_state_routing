@@ -47,6 +47,9 @@ pub fn probeAll(
     neighbors: []const lib.NodeInfo,
     attempts: u32,
     retry_delay_ms: u64,
+    /// 0 => usar el RTT medido. >0 => costo fijo para todo enlace que responda.
+    /// El enlace igual debe contestar el HELLO: uno caido sigue quedando fuera.
+    fixed_cost: i64,
 ) !proto.LinkMap {
     var links: proto.LinkMap = .{};
     errdefer links.map.deinit(allocator);
@@ -54,9 +57,13 @@ pub fn probeAll(
     for (neighbors) |neighbor| {
         var attempt: u32 = 0;
         while (attempt < attempts) : (attempt += 1) {
-            if (probeNeighbor(io, allocator, me, neighbor)) |cost| {
+            if (probeNeighbor(io, allocator, me, neighbor)) |rtt| {
+                const cost = if (fixed_cost > 0) fixed_cost else rtt;
                 try links.map.put(allocator, try allocator.dupe(u8, neighbor.id), cost);
-                std.debug.print("HELLO ok  {s} -> {s} (costo {d} ms)\n", .{ me, neighbor.id, cost });
+                std.debug.print(
+                    "HELLO ok  {s} -> {s} (costo {d}, rtt {d} ms)\n",
+                    .{ me, neighbor.id, cost, rtt },
+                );
                 break;
             } else |err| {
                 if (attempt + 1 == attempts) {
