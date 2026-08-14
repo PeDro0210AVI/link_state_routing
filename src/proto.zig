@@ -14,7 +14,12 @@ pub const Hello = struct {
 };
 
 /// {"<ip_vecino>": <costo>, ...}  -- objeto de claves dinamicas, no un arreglo.
-pub const LinkMap = std.json.ArrayHashMap(i64);
+///
+/// f64 y no i64 a proposito: otras implementaciones mandan el costo como
+/// flotante (medir un RTT en Python da float) y con i64 el LSA entero se
+/// descartaba con error.InvalidNumber. Un costo entero se sigue serializando
+/// sin punto decimal, asi que no cambia lo que emitimos.
+pub const LinkMap = std.json.ArrayHashMap(f64);
 
 /// {
 ///   "type": "LSA", "origin": "<ip_creador>", "seq": <int>, "ttl": <int>,
@@ -23,7 +28,9 @@ pub const LinkMap = std.json.ArrayHashMap(i64);
 pub const Lsa = struct {
     type: []const u8 = LSA,
     origin: []const u8,
-    seq: u32,
+    /// i64 y no u32: hay implementaciones que usan un timestamp como seq y
+    /// desbordaban u32, tumbando el LSA con error.Overflow.
+    seq: i64,
     ttl: i32,
     links: LinkMap,
     from: []const u8,

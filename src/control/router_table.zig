@@ -19,6 +19,11 @@ pub const Hop = struct {
 };
 
 fn findNeighbor(neighbors: []const lib.NodeInfo, id: []const u8) ?lib.NodeInfo {
+    // Dijkstra trabaja con identidades anunciadas, asi que se busca por esa
+    // primero; el id del archivo queda como respaldo si aun no saludo.
+    for (neighbors) |n| {
+        if (std.mem.eql(u8, n.graphId(), id)) return n;
+    }
     for (neighbors) |n| {
         if (std.mem.eql(u8, n.id, id)) return n;
     }

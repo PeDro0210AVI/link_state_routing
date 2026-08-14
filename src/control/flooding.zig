@@ -22,7 +22,7 @@ pub fn flood(
 ) void {
     for (neighbors) |neighbor| {
         if (skip_id) |skip| {
-            if (std.mem.eql(u8, neighbor.id, skip)) continue;
+            if (std.mem.eql(u8, neighbor.graphId(), skip)) continue;
         }
         var stream = network.set_stream(neighbor.port, neighbor.host, io) catch |err| {
             std.debug.print("flooding: no se pudo conectar a {s}: {}\n", .{ neighbor.id, err });

@@ -9,7 +9,7 @@ pub const Links = std.StringArrayHashMapUnmanaged(i64);
 pub const Graph = std.StringArrayHashMapUnmanaged(Links);
 
 pub const Entry = struct {
-    seq: u32,
+    seq: i64,
     links: Links,
 };
 
@@ -53,7 +53,7 @@ pub const Lsdb = struct {
     /// Devuelve true solo si el LSA es mas nuevo que el guardado, es decir,
     /// solo si hay que reenviarlo. Copia las llaves: el buffer del parse es
     /// de vida corta.
-    pub fn insert(self: *Lsdb, origin: []const u8, seq: u32, links: anytype) !bool {
+    pub fn insert(self: *Lsdb, origin: []const u8, seq: i64, links: anytype) !bool {
         self.lock();
         defer self.unlock();
 
@@ -65,7 +65,18 @@ pub const Lsdb = struct {
         errdefer freeLinks(self.allocator, &copy);
         var it = links.iterator();
         while (it.next()) |kv| {
-            try copy.put(self.allocator, try self.allocator.dupe(u8, kv.key_ptr.*), kv.value_ptr.*);
+            // El cable puede traer el costo como flotante; adentro se trabaja
+            // con enteros. Se redondea con piso 1 para no crear aristas de
+            // costo 0, que dejarian a Dijkstra sin poder distinguir rutas.
+            const raw = kv.value_ptr.*;
+            const cost: i64 = switch (@typeInfo(@TypeOf(raw))) {
+                .float => blk: {
+                    const r = @round(raw);
+                    break :blk if (r < 1) 1 else @as(i64, @intFromFloat(r));
+                },
+                else => raw,
+            };
+            try copy.put(self.allocator, try self.allocator.dupe(u8, kv.key_ptr.*), cost);
         }
 
         const gop = try self.entries.getOrPut(self.allocator, origin);

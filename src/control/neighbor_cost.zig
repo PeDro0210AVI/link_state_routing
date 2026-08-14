@@ -15,15 +15,22 @@ const proto = lib.proto;
 /// calibracion para pruebas locales.
 pub const MIN_COST: i64 = 1;
 
-/// Manda un HELLO y espera la respuesta en el mismo socket. Devuelve el RTT en
-/// milisegundos, que es el costo del enlace.
+pub const Probe = struct {
+    rtt: i64,
+    /// El `from` que devolvio el vecino: su identidad real en el protocolo.
+    /// Duplicado con el allocator del llamador.
+    announced_id: []const u8,
+};
+
+/// Manda un HELLO y espera la respuesta en el mismo socket. Devuelve el RTT y
+/// la identidad que el vecino declara.
 pub fn probeNeighbor(
     io: std.Io,
     allocator: std.mem.Allocator,
     me: []const u8,
     neighbor: lib.NodeInfo,
-) !i64 {
-    // Arena de vida corta: la respuesta se descarta, solo interesa el RTT.
+) !Probe {
+    // Arena de vida corta para el parse; lo que sobrevive se duplica al final.
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
 
@@ -32,10 +39,13 @@ pub fn probeNeighbor(
 
     const start = lib.util.nowMs(io);
     try network.sendMessage(io, &stream, proto.Hello{ .from = me });
-    _ = try network.recvMessage(io, &stream, arena_state.allocator(), proto.Hello);
+    const reply = try network.recvMessage(io, &stream, arena_state.allocator(), proto.Hello);
     const rtt = lib.util.nowMs(io) - start;
 
-    return if (rtt < MIN_COST) MIN_COST else rtt;
+    return .{
+        .rtt = if (rtt < MIN_COST) MIN_COST else rtt,
+        .announced_id = try allocator.dupe(u8, reply.from),
+    };
 }
 
 /// Sondea todos los vecinos y arma el mapa `links` del LSA. Un vecino que no
@@ -44,7 +54,8 @@ pub fn probeAll(
     io: std.Io,
     allocator: std.mem.Allocator,
     me: []const u8,
-    neighbors: []const lib.NodeInfo,
+    /// Mutable: al responder el HELLO se le graba al vecino su `announced_id`.
+    neighbors: []lib.NodeInfo,
     attempts: u32,
     retry_delay_ms: u64,
     /// 0 => usar el RTT medido. >0 => costo fijo para todo enlace que responda.
@@ -54,15 +65,32 @@ pub fn probeAll(
     var links: proto.LinkMap = .{};
     errdefer links.map.deinit(allocator);
 
-    for (neighbors) |neighbor| {
+    for (neighbors) |*neighbor| {
         var attempt: u32 = 0;
         while (attempt < attempts) : (attempt += 1) {
-            if (probeNeighbor(io, allocator, me, neighbor)) |rtt| {
-                const cost = if (fixed_cost > 0) fixed_cost else rtt;
-                try links.map.put(allocator, try allocator.dupe(u8, neighbor.id), cost);
+            if (probeNeighbor(io, allocator, me, neighbor.*)) |probe| {
+                const cost = if (fixed_cost > 0) fixed_cost else probe.rtt;
+
+                // El grafo se arma con la identidad que el vecino declara: es la
+                // que usa como `origin` en sus LSAs. Si usaramos la de nuestro
+                // archivo, su LSA quedaria archivado bajo otro nombre y el grafo
+                // se partiria en dos, dejandonos sin rutas mas alla del vecino.
+                if (probe.announced_id.len > 0) {
+                    if (!std.mem.eql(u8, probe.announced_id, neighbor.id)) {
+                        std.debug.print(
+                            "AVISO: {s} esta configurado como \"{s}\" pero se anuncia como \"{s}\".\n" ++
+                                "       Se usara el anunciado. Si es 127.0.0.1, ese vecino olvido --id\n" ++
+                                "       y nadie podra rutear hacia el.\n",
+                            .{ neighbor.host, neighbor.id, probe.announced_id },
+                        );
+                    }
+                    neighbor.announced_id = probe.announced_id;
+                }
+
+                try links.map.put(allocator, try allocator.dupe(u8, neighbor.graphId()), @floatFromInt(cost));
                 std.debug.print(
                     "HELLO ok  {s} -> {s} (costo {d}, rtt {d} ms)\n",
-                    .{ me, neighbor.id, cost, rtt },
+                    .{ me, neighbor.graphId(), cost, probe.rtt },
                 );
                 break;
             } else |err| {

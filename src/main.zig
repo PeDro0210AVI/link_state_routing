@@ -37,7 +37,7 @@ const Node = struct {
     allocator: std.mem.Allocator,
     id: []const u8,
     plane: lib.PlaneType,
-    neighbors: []const lib.NodeInfo,
+    neighbors: []lib.NodeInfo,
     db: *Lsdb,
     table: data.Table,
 };
@@ -256,7 +256,7 @@ fn handleConnection(node: *Node, accepted: std.Io.net.Stream) void {
 // ----------------------------------------------------------- plano control
 
 fn runControlPlane(node: *Node) !void {
-    var seq: u32 = 0;
+    var seq: i64 = 0;
 
     var round: u32 = 0;
     while (round < cli_config.lsa_rounds) : (round += 1) {

@@ -15,6 +15,15 @@ pub const NodeInfo = struct {
     id: []const u8,
     host: []const u8,
     port: u16,
+    /// Identidad que el vecino declara en el `from` de su HELLO. Es la que usa
+    /// como `origin` en sus LSAs, asi que es la unica con la que el grafo cierra.
+    /// Vacia hasta que responda el primer HELLO; entonces manda sobre `id`.
+    announced_id: []const u8 = "",
+
+    /// El nombre con el que este vecino aparece en el grafo.
+    pub fn graphId(self: NodeInfo) []const u8 {
+        return if (self.announced_id.len > 0) self.announced_id else self.id;
+    }
 };
 
 test {
