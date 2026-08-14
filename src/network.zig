@@ -1,43 +1,60 @@
+//! Transporte: una conexion TCP por mensaje, una linea JSON por conexion.
+//!
+//! El acuerdo entre las 3 parejas define JSON plano en el cable. NO se aplica
+//! CRC32 ni Hamming aqui: `error_detection/` es codigo del laboratorio 2 y se
+//! queda fuera de la ruta del cable para no romper la interoperabilidad.
+
 pub const std = @import("std");
-pub const error_detection = @import("error_detection/root.zig");
 
 const net = std.Io.net;
 
-const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Stream = net.Stream;
 
 pub fn set_stream(port: u16, host: []const u8, io: Io) !Stream {
     const peer = try net.IpAddress.parseIp4(host, port);
-
-    const stream = try peer.connect(io, .{ .mode = .stream });
-
-    return stream;
+    return peer.connect(io, .{ .mode = .stream });
 }
 
-pub fn sendMessage(io: std.Io, stream: *Stream, msg: anytype) !void {
-    var buf: [1024]u8 = undefined;
-    var json_writer: std.Io.Writer = .fixed(&buf);
-    try std.json.Stringify.value(msg, .{}, &json_writer);
-    var write_buf: [1024]u8 = undefined;
+/// Serializa `msg` como JSON y lo escribe como una linea terminada en '\n'.
+pub fn sendMessage(io: Io, stream: *Stream, msg: anytype) !void {
+    var write_buf: [4096]u8 = undefined;
     var stream_writer = stream.writer(io, &write_buf);
-    try stream_writer.interface.writeAll(json_writer.buffered());
-    try stream_writer.interface.writeAll("\n");
-    try stream_writer.interface.flush();
+    const w = &stream_writer.interface;
+    try std.json.Stringify.value(msg, .{}, w);
+    try w.writeAll("\n");
+    try w.flush();
 }
 
-pub fn recvMessage(io: std.Io, stream: *Stream, allocator: std.mem.Allocator, comptime T: type) !T {
-    var reader_buf: [1024]u8 = undefined;
+/// Reenvia una linea ya serializada tal cual. El plano de datos la usa para no
+/// re-serializar el paquete: el `payload` es opaco a los routers intermedios.
+pub fn sendRaw(io: Io, stream: *Stream, line: []const u8) !void {
+    var write_buf: [4096]u8 = undefined;
+    var stream_writer = stream.writer(io, &write_buf);
+    const w = &stream_writer.interface;
+    try w.writeAll(line);
+    try w.writeAll("\n");
+    try w.flush();
+}
+
+/// Lee una linea y la duplica en `allocator` (el buffer del reader es local).
+pub fn recvLine(io: Io, stream: *Stream, allocator: std.mem.Allocator) ![]u8 {
+    var reader_buf: [4096]u8 = undefined;
     var stream_reader = stream.reader(io, &reader_buf);
     const raw = try stream_reader.interface.takeDelimiterInclusive('\n');
-    //const encoded = std.mem.trimRight(u8, raw, "\n");
-    const encoded = std.mem.trimEnd(u8, raw, "\n");
+    return allocator.dupe(u8, std.mem.trim(u8, raw, "\r\n"));
+}
 
-    const framed = try error_detection.hamming.decode(allocator, encoded);
-    defer allocator.free(framed);
+/// `ignore_unknown_fields` es deliberado: las otras implementaciones pueden
+/// mandar campos extra y eso no debe tumbar el nodo.
+pub fn parse(comptime T: type, allocator: std.mem.Allocator, line: []const u8) !T {
+    return std.json.parseFromSliceLeaky(T, allocator, line, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+}
 
-    const payload = try error_detection.crc32.verify(allocator, framed);
-    defer allocator.free(payload);
-
-    return std.json.parseFromSliceLeaky(T, allocator, payload, .{ .allocate = .alloc_always });
+pub fn recvMessage(io: Io, stream: *Stream, allocator: std.mem.Allocator, comptime T: type) !T {
+    const line = try recvLine(io, stream, allocator);
+    return parse(T, allocator, line);
 }

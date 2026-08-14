@@ -1,0 +1,1 @@
+{"type":"AUTH","origin":"127.0.0.1:5051","destination":"127.0.0.1:5054","payload":{"user":"jbenitez","pin":"1234"}}

@@ -2,15 +2,43 @@ const lib = @import("link_state_routing");
 pub const cli = @import("cli");
 pub const std = @import("std");
 pub const builtin = @import("builtin");
-pub const ArrayList = std.ArrayList;
+
+const control = lib.control;
+const data = lib.data;
+const network = lib.network;
+const proto = lib.proto;
+const util = lib.util;
+const Lsdb = control.lsdb.Lsdb;
 
 var cli_config = struct {
-    routing_table_path: []const u8 = "data/routing_table.csv",
+    /// Identificador de este nodo tal como viaja en el cable ("from"/"origin").
+    /// Vacio => se usa "host:port", que es lo que distingue los 6 nodos cuando
+    /// corren todos en 127.0.0.1. Sobre Tailscale conviene la IP a secas.
+    id: []const u8 = "",
+    routing_table_path: []const u8 = "data/nodo_tabla_enrutamiento.csv",
     nodes_neighbors_path: []const u8 = "data/neighbors_ips.txt",
     host: []const u8 = "127.0.0.1",
     port: u16 = 8080,
     plane_type: []const u8 = "Control",
+    /// Plano de datos: archivo JSON con un paquete a inyectar en la red.
+    send: []const u8 = "",
+    hello_attempts: u32 = 10,
+    hello_retry_ms: u64 = 500,
+    lsa_rounds: u32 = 3,
+    round_delay_ms: u64 = 1500,
+    converge_timeout_ms: u64 = 20000,
+    stable_ms: u64 = 2000,
 }{};
+
+const Node = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    id: []const u8,
+    plane: lib.PlaneType,
+    neighbors: []const lib.NodeInfo,
+    db: *Lsdb,
+    table: data.Table,
+};
 
 pub fn main(init: std.process.Init) !void {
     var r = cli.AppRunner.init(&init);
@@ -18,27 +46,48 @@ pub fn main(init: std.process.Init) !void {
     const app = cli.App{
         .command = cli.Command{
             .name = "node",
-            .options = try r.allocOptions(&.{ .{
-                .long_name = "routing_table_path",
-                .help = "Path routings references",
-                .value_ref = r.mkRef(&cli_config.routing_table_path),
-            }, .{
-                .long_name = "nodes_neighbors_path",
-                .help = "path with NodeInfo for each neighbor",
-                .value_ref = r.mkRef(&cli_config.nodes_neighbors_path),
-            }, .{
-                .long_name = "host",
-                .help = "Node Host",
-                .value_ref = r.mkRef(&cli_config.host),
-            }, .{
-                .long_name = "port",
-                .help = "Node port",
-                .value_ref = r.mkRef(&cli_config.port),
-            }, .{
-                .long_name = "plane_type",
-                .help = "type of plane the node is working one",
-                .value_ref = r.mkRef(&cli_config.plane_type),
-            } }),
+            .options = try r.allocOptions(&.{
+                .{
+                    .long_name = "id",
+                    .help = "Node id on the wire (default: host:port)",
+                    .value_ref = r.mkRef(&cli_config.id),
+                },
+                .{
+                    .long_name = "routing_table_path",
+                    .help = "Path routings references",
+                    .value_ref = r.mkRef(&cli_config.routing_table_path),
+                },
+                .{
+                    .long_name = "nodes_neighbors_path",
+                    .help = "path with NodeInfo for each neighbor",
+                    .value_ref = r.mkRef(&cli_config.nodes_neighbors_path),
+                },
+                .{
+                    .long_name = "host",
+                    .help = "Node Host",
+                    .value_ref = r.mkRef(&cli_config.host),
+                },
+                .{
+                    .long_name = "port",
+                    .help = "Node port",
+                    .value_ref = r.mkRef(&cli_config.port),
+                },
+                .{
+                    .long_name = "plane_type",
+                    .help = "type of plane the node is working one",
+                    .value_ref = r.mkRef(&cli_config.plane_type),
+                },
+                .{
+                    .long_name = "send",
+                    .help = "Data plane: JSON file with a packet to inject",
+                    .value_ref = r.mkRef(&cli_config.send),
+                },
+                .{
+                    .long_name = "converge_timeout_ms",
+                    .help = "Control plane: give up waiting for convergence",
+                    .value_ref = r.mkRef(&cli_config.converge_timeout_ms),
+                },
+            }),
             .target = cli.CommandTarget{
                 .action = cli.CommandAction{ .exec = run },
             },
@@ -48,89 +97,199 @@ pub fn main(init: std.process.Init) !void {
 }
 
 pub fn run() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer switch (builtin.mode) {
-        .Debug => std.debug.assert(debug_allocator.deinit() == .ok),
-        .ReleaseFast, .ReleaseSmall, .ReleaseSafe => {},
-    };
-    const allocator = switch (builtin.mode) {
-        .Debug => debug_allocator.allocator(),
-        .ReleaseFast, .ReleaseSmall, .ReleaseSafe => std.heap.smp_allocator,
-    };
+    // smp_allocator: el hilo servidor y el hilo principal comparten allocator.
+    const allocator = std.heap.smp_allocator;
+
     var arena_state = std.heap.ArenaAllocator.init(allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
     var threaded: std.Io.Threaded = .init(allocator, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    // Setup server
-    const loopback = try std.Io.net.IpAddress.parseIp4(cli_config.host, cli_config.port);
-    var server = try loopback.listen(io, .{ .reuse_address = true });
-    defer server.deinit(io);
-    std.debug.print("Node listening on {s}:{d}\n", .{ cli_config.host, cli_config.port });
-    // Spawn server thread
-    _ = try std.Thread.spawn(.{}, serverLoop, .{ &server, io });
-    // Connect to neighbors with timeout
-    var streams = std.ArrayList(std.Io.net.Stream).empty;
-    defer streams.deinit(arena);
-    const structure_hosts_list = try lib.util.get_hosts_from_neighbors_path(io, arena, cli_config.nodes_neighbors_path);
-    for (structure_hosts_list.items, 0..) |host_info, idx| {
-        const host = host_info.@"0";
-        const port = host_info.@"1";
-        const thread = try std.Thread.spawn(.{}, connectWithTimeout, .{ host, port, io, arena, &streams, idx + 1 });
-        thread.join();
+
+    const me = if (cli_config.id.len > 0)
+        cli_config.id
+    else
+        try std.fmt.allocPrint(arena, "{s}:{d}", .{ cli_config.host, cli_config.port });
+
+    const upper_raw_plane_type = try util.allocUpperString(arena, cli_config.plane_type);
+    const plane = try util.from_u8_array_in_to_plane_type_enums(upper_raw_plane_type);
+
+    const neighbors = try util.get_neighbors_from_path(io, arena, cli_config.nodes_neighbors_path);
+
+    var db = Lsdb.init(allocator, io);
+    defer db.deinit();
+
+    var node = Node{
+        .io = io,
+        .allocator = allocator,
+        .id = me,
+        .plane = plane,
+        .neighbors = neighbors.items,
+        .db = &db,
+        .table = .empty,
+    };
+
+    if (plane == .Data) {
+        node.table = control.router_table.load(io, arena, cli_config.routing_table_path) catch |err| {
+            std.debug.print(
+                "No se pudo leer {s} ({}). Corre primero el plano de control.\n",
+                .{ cli_config.routing_table_path, err },
+            );
+            return err;
+        };
     }
-    std.debug.print("Connected to {d}/{d} neighbors\n", .{ streams.items.len, structure_hosts_list.items.len });
-    // Parse plane type
-    const upper_raw_plane_type = try lib.util.allocUpperString(arena, cli_config.plane_type);
-    const plane_type = try lib.util.from_u8_array_in_to_plane_type_enums(upper_raw_plane_type);
-    // Run based on plane type
-    switch (plane_type) {
-        lib.PlaneType.Control => {
-            std.debug.print("Running as Control Plane\n", .{});
-            // TODO: Build router with LSA
-            //try lib.router.buildRouter(arena, structure_hosts_list.items, &streams);
-            while (true) {
-                // Control plane loop
-            }
-        },
-        lib.PlaneType.Data => {
-            std.debug.print("Running as Data Plane\n", .{});
-            while (true) {
-                // Data plane loop
-            }
-        },
+
+    const address = try std.Io.net.IpAddress.parseIp4(cli_config.host, cli_config.port);
+    var server = try address.listen(io, .{ .reuse_address = true });
+    // Sin `defer server.deinit(io)`: el hilo servidor esta bloqueado en accept()
+    // sobre este socket, y cerrarlo desde aqui lo hace entrar en panic con BADF.
+    // El proceso termina con process.exit mas abajo y el SO libera el socket.
+    std.debug.print("Nodo {s} escuchando en {s}:{d} ({s})\n", .{
+        me, cli_config.host, cli_config.port, @tagName(plane),
+    });
+
+    const server_thread = try std.Thread.spawn(.{}, serverLoop, .{ &node, &server });
+    server_thread.detach();
+
+    switch (plane) {
+        .Control => try runControlPlane(&node),
+        .Data => try runDataPlane(&node, arena),
     }
+
+    // Termina sin desenrollar: el hilo servidor sigue detached sobre el socket.
+    std.process.exit(0);
 }
 
-fn serverLoop(server: *std.Io.net.Server, io: std.Io) void {
-    std.debug.print("Server accepting connections...\n", .{});
+// ---------------------------------------------------------------- servidor
+
+fn serverLoop(node: *Node, server: *std.Io.net.Server) void {
     while (true) {
-        const connection = server.accept(io) catch continue;
-        defer connection.close(io);
-        std.debug.print("Accepted connection from neighbor\n", .{});
+        const conn = server.accept(node.io) catch continue;
+        // Un hilo por conexion: si no, el flooding de un LSA bloquea los HELLO
+        // que estan llegando y los vecinos nos marcan como caidos.
+        const t = std.Thread.spawn(.{}, handleConnection, .{ node, conn }) catch {
+            handleConnection(node, conn);
+            continue;
+        };
+        t.detach();
     }
 }
 
-fn connectWithTimeout(host: []const u8, port: u16, io: std.Io, allocator: std.mem.Allocator, streams: *std.ArrayList(std.Io.net.Stream), neighbor_id: usize) void {
-    std.debug.print("Connecting to neighbor {d}: {s}:{d} (timeout: 20s)\n", .{ neighbor_id, host, port });
+fn handleConnection(node: *Node, accepted: std.Io.net.Stream) void {
+    var stream = accepted;
+    defer stream.close(node.io);
 
-    const max_attempts = 40; // 40 attempts
-    var attempt: u32 = 0;
+    var arena_state = std.heap.ArenaAllocator.init(node.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
 
-    while (attempt < max_attempts) {
-        attempt += 1;
+    const line = network.recvLine(node.io, &stream, arena) catch return;
+    const msg_type = proto.peekType(arena, line) catch |err| {
+        std.debug.print("paquete sin \"type\" ({}), descartado\n", .{err});
+        return;
+    };
 
-        if (lib.network.set_stream(port, host, io)) |stream| {
-            std.debug.print("✓ Connected to neighbor {d} on attempt {d}\n", .{ neighbor_id, attempt });
-            streams.append(allocator, stream) catch return;
+    if (std.mem.eql(u8, msg_type, proto.HELLO)) {
+        // El acuerdo no define paquete de respuesta: devolvemos un HELLO
+        // identico para que el emisor pueda medir el RTT.
+        network.sendMessage(node.io, &stream, proto.Hello{ .from = node.id }) catch {};
+        return;
+    }
+
+    if (std.mem.eql(u8, msg_type, proto.LSA)) {
+        const incoming = network.parse(proto.Lsa, arena, line) catch |err| {
+            std.debug.print("LSA malformado ({}), descartado\n", .{err});
             return;
-        } else |_| {
-            // Busy loop delay (no sleep available in Zig 0.16)
-            var i: u32 = 0;
-            while (i < 10000000) : (i += 1) {}
+        };
+        _ = control.flooding.handleLsa(node.io, node.db, node.id, node.neighbors, incoming) catch |err| {
+            std.debug.print("error procesando LSA: {}\n", .{err});
+        };
+        return;
+    }
+
+    // Cualquier otro type es trafico de datos (AUTH/WITHDRAW/ERROR/LOGOUT).
+    if (node.plane == .Data) {
+        _ = data.route(node.io, arena, node.id, node.table, line);
+    } else {
+        std.debug.print("plano de control: se ignora paquete de datos type={s}\n", .{msg_type});
+    }
+}
+
+// ----------------------------------------------------------- plano control
+
+fn runControlPlane(node: *Node) !void {
+    var seq: u32 = 0;
+
+    var round: u32 = 0;
+    while (round < cli_config.lsa_rounds) : (round += 1) {
+        var links = try control.neighbor_cost.probeAll(
+            node.io,
+            node.allocator,
+            node.id,
+            node.neighbors,
+            cli_config.hello_attempts,
+            cli_config.hello_retry_ms,
+        );
+        defer {
+            for (links.map.keys()) |k| node.allocator.free(k);
+            links.map.deinit(node.allocator);
+        }
+
+        seq += 1;
+        _ = try node.db.insert(node.id, seq, links.map);
+        control.flooding.flood(node.io, node.neighbors, control.lsa.build(node.id, seq, links), null);
+        std.debug.print("LSA propio seq={d} inundado a {d} vecinos\n", .{ seq, node.neighbors.len });
+
+        util.sleepMs(node.io, cli_config.round_delay_ms);
+    }
+
+    // Convergencia: la LSDB deja de moverse durante `stable_ms`.
+    const tick: u64 = 250;
+    var last_version = node.db.currentVersion();
+    var stable: u64 = 0;
+    var waited: u64 = 0;
+    while (stable < cli_config.stable_ms and waited < cli_config.converge_timeout_ms) {
+        util.sleepMs(node.io, tick);
+        waited += tick;
+        const v = node.db.currentVersion();
+        if (v == last_version) {
+            stable += tick;
+        } else {
+            last_version = v;
+            stable = 0;
         }
     }
+    std.debug.print(
+        "Convergencia: {d} nodos en la LSDB tras {d} ms\n",
+        .{ node.db.originCount(), waited },
+    );
 
-    std.debug.print("✗ Failed to connect to neighbor {d} after {d} attempts\n", .{ neighbor_id, max_attempts });
+    var arena_state = std.heap.ArenaAllocator.init(node.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const graph = try node.db.snapshot(arena);
+    const routes = try control.spf.shortestPaths(arena, graph, node.id);
+
+    try control.router_table.write(node.io, cli_config.routing_table_path, routes, node.neighbors);
+    std.debug.print("Tabla escrita en {s}:\n{s}\n", .{ cli_config.routing_table_path, control.router_table.HEADER });
+    for (routes) |r| {
+        std.debug.print("  {s},{s},{d}\n", .{ r.dest, r.next_hop, r.cost });
+    }
+}
+
+// -------------------------------------------------------------- plano datos
+
+fn runDataPlane(node: *Node, arena: std.mem.Allocator) !void {
+    std.debug.print("Tabla cargada: {d} destinos\n", .{node.table.count()});
+
+    if (cli_config.send.len > 0) {
+        try data.inject(node.io, arena, node.id, node.table, cli_config.send);
+        return;
+    }
+
+    // Solo reenvia; el trabajo ocurre en el hilo servidor.
+    while (true) util.sleepMs(node.io, 1000);
 }

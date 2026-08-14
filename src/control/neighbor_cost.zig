@@ -1,45 +1,74 @@
-pub const control = @import("root");
-pub const network = @import("../root.zig").network;
+//! Descubrimiento de vecinos y costo de enlace via HELLO.
+//!
+//! El acuerdo define solo `{"type":"HELLO","from":"<ip_origen>"}` y dice que un
+//! vecino que no responde en un tiempo X se considera caido. No fija el paquete
+//! de respuesta, asi que respondemos un HELLO identico: no inventa campos.
 
 const std = @import("std");
-const net = std.Io.net;
+const lib = @import("../root.zig");
 
-const ArrayList = std.ArrayList;
-const Allocator = std.mem.Allocator;
-const Io = std.Io;
-const Stream = net.Stream;
+const network = lib.network;
+const proto = lib.proto;
 
-fn HelloPackages() type {
-    return struct { type: []const u8, from: []const u8 };
+/// Costo minimo. En loopback el RTT redondea a 0 ms y entonces todas las rutas
+/// empatan en 0 y Dijkstra deja de distinguirlas. El piso en 1 es la perilla de
+/// calibracion para pruebas locales.
+pub const MIN_COST: i64 = 1;
+
+/// Manda un HELLO y espera la respuesta en el mismo socket. Devuelve el RTT en
+/// milisegundos, que es el costo del enlace.
+pub fn probeNeighbor(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    me: []const u8,
+    neighbor: lib.NodeInfo,
+) !i64 {
+    // Arena de vida corta: la respuesta se descarta, solo interesa el RTT.
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+
+    var stream = try network.set_stream(neighbor.port, neighbor.host, io);
+    defer stream.close(io);
+
+    const start = lib.util.nowMs(io);
+    try network.sendMessage(io, &stream, proto.Hello{ .from = me });
+    _ = try network.recvMessage(io, &stream, arena_state.allocator(), proto.Hello);
+    const rtt = lib.util.nowMs(io) - start;
+
+    return if (rtt < MIN_COST) MIN_COST else rtt;
 }
 
-// returns the node label and it's cost
-pub fn send_hello_to_neighbor(raw_node_ip: []const u8, io: std.Io, stream: *Stream, allocator: std.mem.Allocator) !std.StringHashMap(i64) {
-    const hello_pkg: HelloPackages = .{ .type = "HELLO", .from = raw_node_ip };
+/// Sondea todos los vecinos y arma el mapa `links` del LSA. Un vecino que no
+/// responde tras `attempts` intentos queda fuera del LSA: enlace caido.
+pub fn probeAll(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    me: []const u8,
+    neighbors: []const lib.NodeInfo,
+    attempts: u32,
+    retry_delay_ms: u64,
+) !proto.LinkMap {
+    var links: proto.LinkMap = .{};
+    errdefer links.map.deinit(allocator);
 
-    // for creating the costs
-    const start = std.Io.Clock.now(.awake, io);
-
-    try network.sendMessage(io, stream, hello_pkg);
-
-    const node_hello_pkg = try network.recvMessage(io, stream, allocator, HelloPackages());
-
-    const end = std.Io.Clock.now(.awake, io);
-    const duration = start.durationTo(end);
-
-    var node_entry = std.StringHashMap(i64).init(allocator);
-    try node_entry.put(node_hello_pkg.from, duration.toMilliseconds());
-
-    return node_entry;
-}
-
-pub fn find_neighbors_costs(raw_node_ip: []const u8, io: std.Io, streams: ArrayList(*Stream), allocator: std.mem.Allocator) !ArrayList(control.NodeRouter()) {
-    var neigbors_costs: std.StringHashMap(i64) = .{};
-    defer neigbors_costs.deinit(allocator);
-
-    for (0..streams.items.len - 1) |stream_idx| {
-        try neigbors_costs.append(allocator, send_hello_to_neighbor(raw_node_ip, io, streams[stream_idx], allocator));
+    for (neighbors) |neighbor| {
+        var attempt: u32 = 0;
+        while (attempt < attempts) : (attempt += 1) {
+            if (probeNeighbor(io, allocator, me, neighbor)) |cost| {
+                try links.map.put(allocator, try allocator.dupe(u8, neighbor.id), cost);
+                std.debug.print("HELLO ok  {s} -> {s} (costo {d} ms)\n", .{ me, neighbor.id, cost });
+                break;
+            } else |err| {
+                if (attempt + 1 == attempts) {
+                    std.debug.print(
+                        "HELLO sin respuesta de {s} tras {d} intentos ({}): enlace caido\n",
+                        .{ neighbor.id, attempts, err },
+                    );
+                } else {
+                    lib.util.sleepMs(io, retry_delay_ms);
+                }
+            }
+        }
     }
-
-    return neigbors_costs;
+    return links;
 }
